@@ -1,0 +1,352 @@
+subroutine scf_abinitio
+use gaussian_basis
+implicit double precision (a-h,o-z)
+include 'mpif.h'
+interface
+subroutine mkvector(matrix,vector,idim1)
+double precision,dimension(:,:),intent(in)::matrix
+double precision,dimension(:),intent(inout)::vector
+integer,intent(in)::idim1
+end subroutine mkvector
+
+subroutine square(matrix,vector,idim1)
+double precision,dimension(:,:),intent(inout)::matrix
+double precision,dimension(:),intent(in)::vector
+integer,intent(in)::idim1
+end subroutine square
+
+
+subroutine build_g(density,g)
+double precision,intent(inout),dimension(:)::density,g
+end subroutine build_g
+
+
+subroutine pulay_ab(oldfock,error,fock,iter,ldim)
+double precision,dimension(:,:),intent(in)::oldfock,error
+double precision,dimension(:),intent(inout)::fock
+integer,intent(in)::iter,ldim
+end subroutine pulay_ab
+
+
+
+end interface
+
+
+double precision,dimension(:,:),allocatable::vecs,test,oldfock,error,scrmat,scrmat2,scrmat3,scrmat4,overlap_sq,scrmat5,&
+qvecs
+double precision,dimension(:),allocatable::fock,density,vec2,work,scrvec2,scrvec,scrvec3 &
+,hcore,overlap
+integer,dimension(:),allocatable::iwork,ifail
+character(10) date,time,pretty_time
+maxiter=60
+
+
+call cpusec(timein)
+if(myrank.eq.0)then
+print*,'-----------------------------------------------'
+print*,'|                                             |'
+print*,'|    HARTREE FOCK SELF CONSISTENT FIELD       |'
+print*,'|             Gaussian Basis                  |'
+print*,'-----------------------------------------------'
+print*,''
+
+call date_and_time(date,time)
+write(*,*)'SCF started at: ',time(1:2),':',time(3:4),':',time(5:6) &
+,' on ',date(5:6) ,'/', date(7:8),'/',date(1:4)
+end if
+
+
+
+!!!!!!!!!!!!!!!!
+! stuff to be common blocked later 
+!repel=465.4340695205
+!nelectrons=64
+zero=0.
+!!!!!!!!!!!!!!!
+!ihigh=num_gauss-(nelectrons/2)+1
+icol=nelectrons/2 !will have to change for uhf
+
+allocate(density(iveclength))
+allocate(scrvec(iveclength))
+allocate(scrvec2(iveclength))
+allocate(scrvec3(iveclength))
+allocate(glocal(iveclength))
+allocate(scrmat(num_gauss,num_gauss))
+allocate(scrmat2(num_gauss,num_gauss))
+allocate(scrmat3(num_gauss,num_gauss))
+!allocate(vecs(num_gauss,num_gauss))
+allocate(vec2(num_gauss))
+allocate(fock(iveclength))
+allocate(hcore(iveclength))
+allocate(overlap(iveclength))
+!diis stuff ! keyword this up later
+allocate(oldfock(iveclength,50)) ! change 50 to maxiter
+nlen=num_gauss*num_gauss
+allocate(error(nlen,50)) ! change 50 to maxiter
+allocate(scrmat4(num_gauss,num_gauss))
+allocate(overlap_sq(num_gauss,num_gauss))
+allocate(scrmat5(num_gauss,num_gauss))
+allocate(density_global(num_gauss,num_gauss))
+allocate(density_q(num_gauss,num_gauss))
+allocate(qvecs(num_gauss,num_gauss))
+!end diis stuff
+open(unit=10,file='hcore')
+!open(unit=10,file='aints')
+do
+read(10,*,iostat=io)indi,indj,value1,value2
+if(io<0)exit
+call pack(indi,indj,ij)
+hcore(ij)=value1+value2
+end do
+close(10)
+
+open(unit=10,file='overlap')
+do
+read(10,*,iostat=io)indi,indj,value1
+if(io<0)exit
+!print*,indi,indj,value
+call pack(indi,indj,ij)
+!!if(dabs(value1).lt.1d-15)value1=0.0d0
+overlap(ij)=value1
+end do
+close(10)
+
+!if(diis) do this....
+call square(overlap_sq,overlap,num_gauss) 
+
+
+! generate initial guess
+! diagonalize overlap matrix
+call square(scrmat,overlap,num_gauss)
+
+
+!call matprt(scrmat,num_gauss,num_gauss,num_gauss,num_gauss)
+!if(myrank.eq.0)call eig(scrmat,scrmat3,num_gauss,num_gauss,0)
+
+if(myrank.eq.0)call tred3(num_gauss,num_gauss,scrmat,scrvec,vec2,scrmat3)
+if(myrank.eq.0)call tql3(num_gauss,num_gauss,scrvec,vec2,scrmat3,iout)
+
+call eigsrt(scrvec,scrmat3,num_gauss,num_gauss)
+
+!check for linear dependencies
+iorbs=num_gauss
+ilin=0
+do i=1,num_gauss
+if(scrvec(i).lt.lindep_tol)ilin=ilin+1
+!if(myrank.eq.0)print*,i,scrvec(i)
+end do
+if(myrank.eq.0)print*,''
+if(myrank.eq.0)print*,'Lowest eigenvalue of overlap matrix',scrvec(num_gauss)
+if(myrank.eq.0)print*,''
+
+if(ilin.ne.0)then
+iorbs=num_gauss-ilin
+  if(myrank.eq.0)then
+     print*,'****Linear dependencies detected!****'
+     print*,ilin,'orbitals removed from basis'
+     print*,'Size of basis is now',iorbs,' functions'
+  end if
+end if
+ihigh=iorbs-(nelectrons/2)+1
+
+
+call mpi_barrier(mpi_comm_world,ierr)
+!scrmat=0.0
+! make s(-1/2)
+!do i=1,iorbs !num_gauss
+!scrmat(i,i)=1.0D0/dsqrt(scrvec(i))
+!end do
+
+!call dgemm( 'N', 'N', num_gauss, num_gauss, num_gauss, 1.0d0,scrmat3 &
+! , num_gauss,scrmat , num_gauss,0.,scrmat2,num_gauss )
+ 
+
+do i=1,iorbs
+do j=1,num_gauss
+scrmat2(j,i)=scrmat3(j,i)/dsqrt(scrvec(i))
+end do
+end do
+
+
+! so scrmat2 holds the X matrix for rest of subroutine
+
+! transform hcore to symm orthog basis
+call square(scrmat,hcore,num_gauss)
+!call matprt(scrmat2,num_gauss,num_gauss,num_gauss,num_gauss)
+
+call dgemm( 'T', 'N', iorbs, num_gauss, num_gauss, 1.0d0,scrmat2 &
+ , num_gauss,scrmat , num_gauss,0.,scrmat3,iorbs )
+
+if(myrank.eq.0)print*,'Figure out why i need this line'
+
+call dgemm( 'N', 'N', iorbs, iorbs, num_gauss, 1.0d0,scrmat3 &
+ , iorbs,scrmat2 , num_gauss,0.,scrmat,iorbs )
+!call matprt(scrmat,num_gauss,num_gauss,num_gauss,num_gauss)
+
+
+!scrmat now holds hprime
+!if(myrank.eq.0)call eig(scrmat,scrmat3,num_gauss,num_gauss,0)
+if(myrank.eq.0)call tred3(iorbs,iorbs,scrmat,scrvec,vec2,scrmat3)
+if(myrank.eq.0)call tql3(iorbs,iorbs,scrvec,vec2,scrmat3,iout)
+call eigsrt(scrvec,scrmat3,iorbs,iorbs)
+
+call mpi_barrier(mpi_comm_world,ierr)
+!hprime to overlapping basis
+call dgemm( 'N', 'N', num_gauss, iorbs, iorbs, 1.0d0,scrmat2 &
+ , num_gauss,scrmat3 , iorbs,0.,scrmat,num_gauss )
+
+
+call dgemm( 'N', 'T', num_gauss, num_gauss, icol, 2.0d0,scrmat(1:num_gauss,ihigh:iorbs) &
+ , num_gauss,scrmat(1:num_gauss,ihigh:iorbs) , num_gauss,zero,scrmat3,num_gauss )
+
+!call matprt(scrmat3,num_gauss,num_gauss,num_gauss,num_gauss)
+!stop
+call mkvector(scrmat3,density,num_gauss)
+
+call mpi_bcast(density,iveclength,mpi_double_precision,0,mpi_comm_world,ierr)
+call mpi_barrier(mpi_comm_world,ierr)
+call build_g(density,scrvec3)
+
+!call square(scrmat,scrvec3,num_gauss)
+!call matprt(scrmat,num_gauss,num_gauss,num_gauss,num_gauss)
+!stop
+iter=0
+olden=0.
+idiis=0
+oldfock=0.
+error=0.
+1 iter=iter+1
+scrvec=hcore+scrvec3 ! fock matrix
+
+
+! compute energy tr(P(h+f))
+scrvec2=density*(scrvec+hcore)
+call square(scrmat,scrvec2,num_gauss)
+energy=.5d0*sum(scrmat)
+energy=energy+repulsion_nuc
+deltae=energy-olden
+if(myrank.eq.0)write(*,3)iter,energy,deltae
+3 format(i3,f20.12,f20.12)
+call mpi_bcast(deltae,1,mpi_double_precision,0,mpi_comm_world,ierr)
+if(abs(deltae).lt.1d-10 )then
+if(myrank.eq.0)print*,''
+if(myrank.eq.0)print*,'Converged!'
+goto 40
+end if 
+
+if(iter.gt.5)then
+idiis=idiis+1
+! compute FPS-SPF
+call square(scrmat,scrvec,num_gauss)
+call square(scrmat3,density,num_gauss)
+call dgemm( 'N', 'N', num_gauss, num_gauss, num_gauss,1.0d0,scrmat3 &
+ , num_gauss,scrmat , num_gauss,0.,scrmat4,num_gauss )
+call dgemm( 'N', 'N', num_gauss, num_gauss, num_gauss,1.0d0,overlap_sq &
+ , num_gauss,scrmat4 , num_gauss,0.,scrmat5,num_gauss )
+
+call dgemm( 'N', 'N', num_gauss, num_gauss, num_gauss,1.0d0,scrmat &
+ , num_gauss,scrmat3 , num_gauss,0.0d0,scrmat4,num_gauss )
+call dgemm( 'N', 'N', num_gauss, num_gauss, num_gauss,1.0d0,scrmat4 &
+ , num_gauss,overlap_sq , num_gauss,-1.0d0,scrmat5,num_gauss )
+
+call dcopy(nlen,scrmat5(1,1),1,error(1,idiis),1)
+call dcopy(iveclength,scrvec,1,oldfock(1,idiis),1)
+if(iter.gt.4)call pulay_ab(oldfock,error,scrvec,idiis,idiis+1)
+end if
+
+
+
+call square(scrmat,scrvec,num_gauss) ! square fock matrix
+call dgemm( 'T', 'N', iorbs, num_gauss, num_gauss, 1.0d0,scrmat2 &
+ , num_gauss,scrmat , num_gauss,0.,scrmat3,iorbs )
+call dgemm( 'N', 'N', iorbs, iorbs, num_gauss, 1.0d0,scrmat3 &
+ , iorbs,scrmat2 , num_gauss,0.,scrmat,iorbs )
+
+
+if(myrank.eq.0)call tred3(iorbs,iorbs,scrmat,scrvec,vec2,scrmat3)
+if(myrank.eq.0)call tql3(iorbs,iorbs,scrvec,vec2,scrmat3,iout)
+!print*,'sort',scrvec
+call eigsrt(scrvec,scrmat3,iorbs,iorbs)
+!print*,'done',scrvec
+call mpi_barrier(mpi_comm_world,ierr)
+
+
+
+call dgemm( 'N', 'N', num_gauss, iorbs, iorbs, 1.0d0,scrmat2 &
+ , num_gauss,scrmat3 , iorbs,0.,scrmat,num_gauss )
+call dgemm( 'N', 'T', num_gauss, num_gauss, icol, 2.0d0,scrmat(1:num_gauss,ihigh:iorbs) &
+ , num_gauss,scrmat(1:num_gauss,ihigh:iorbs) , num_gauss,zero,scrmat3,num_gauss )
+
+!print*,scrvec
+!print*,scrmat
+
+!compute scaled vecs for gradient
+do i=1,num_gauss
+factor=scrvec(i)
+do j=1,num_gauss
+qvecs(j,i)=factor*scrmat(j,i)
+end do
+end do
+call dgemm( 'N', 'T', num_gauss, num_gauss, icol, 2.0d0,qvecs(1:num_gauss,ihigh:iorbs) &
+ , num_gauss,scrmat(1:num_gauss,ihigh:iorbs) , num_gauss,zero,density_q,num_gauss )
+
+
+
+!print*,'qmatrix'
+!call matprt(density_q,num_gauss,num_gauss,num_gauss,num_gauss)
+
+
+
+scrvec2=density
+call mkvector(scrmat3,density,num_gauss)
+!debug block
+density_global=scrmat3
+!open(unit=36,file='dkeep')
+!write(36,*)density_global
+!close(36)
+!open(unit=36,file='dkeepvec')
+!write(36,*)density
+!close(36)
+!open(unit=36,file='dkeep')
+!read(36,*)density_global
+!close(36)
+!open(unit=36,file='dkeepvec')
+!read(36,*)scrvec
+!close(36)
+!call build_g(scrvec,scrvec3)
+!call square(scrmat,scrvec3,num_gauss)
+!senergy=sum(density_global*scrmat)
+!print*,'two e energy is ',0.5*senergy,energy-repulsion_nuc
+!end debug block
+
+
+
+
+
+pdelta=0.
+do i=1,iveclength
+pdelta=pdelta+(density(i)-scrvec2(i))**2
+end do
+
+call mpi_bcast(density,iveclength,mpi_double_precision,0,mpi_comm_world,ierr)
+call mpi_barrier(mpi_comm_world,ierr)
+call build_g(density,scrvec3)
+olden=energy
+goto 1
+
+40 continue
+
+if(myrank.eq.0)then
+call date_and_time(date,time)
+write(*,*)'SCF ended at: ',time(1:2),':',time(3:4),':',time(5:6) &
+,' on ',date(5:6) ,'/', date(7:8),'/',date(1:4)
+call cpusec(timeout)
+write(*,200)timeout-timein
+end if
+200 format(' SCF computation time (sec) =  ',F10.3)
+
+
+call mpi_barrier(mpi_comm_world,ierr)
+
+return
+end

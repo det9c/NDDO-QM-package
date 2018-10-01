@@ -1,0 +1,25 @@
+subroutine build_g(density,g)
+use gaussian_basis
+implicit double precision (a-h,o-z)
+double precision,intent(inout),dimension(:,:)::density,g
+half=.5d0
+
+g=0.
+open(unit=1,file='twoe')
+do
+read(1,*,iostat=io)imu,inu,ila,isig,value
+if(io<0)exit
+value=value*SCALE
+
+
+
+call pack(indi,indj,ij)
+
+
+
+
+
+
+end do
+close(1)
+
